@@ -1,0 +1,147 @@
+---
+title: "BGC_modelR"
+format: html
+editor: visual
+---
+
+Translating this Python script to R requires adapting the classes, configuration handling, and geospatial operations using R’s packages such as `data.table`, `sf`, and `terra`. Here is an R equivalent for key parts of the script, emphasizing efficient data manipulation and spatial processing.
+This R script provides an outline for key processes from the Python script, focusing on R functions in sf and terra for spatial processing and raster manipulation, and data.table for fast data handling. Additional model-specific details (such as classifications and configurations) can be implemented in the initialize_bec function and other helper functions to match the specific needs of the BEC model translation.
+
+### 1. Load Necessary Libraries
+
+```{r}
+library(data.table)
+library(sf)
+library(terra)
+library(lubridate)
+library(config)
+library(jsonlite)
+```
+
+2\. Configurations and Custom Error Handling
+
+```{r}
+# Load configurations using a JSON or YAML configuration file.
+config <- config::get(file = "config.yml")
+
+# Define custom error functions for config validation
+config_error <- function(message) stop(paste("Configuration Error:", message))
+config_value_error <- function(message) stop(paste("Configuration Value Error:", message))
+
+# Validate the configuration
+validate_config <- function(config) {
+  required_keys <- c("rulepolys_file", "elevation", "cell_size_metres", "temp_folder")
+  
+  for (key in required_keys) {
+    if (is.null(config[[key]]) || !file.exists(config[[key]])) {
+      config_value_error(paste(key, "does not exist or is not configured."))
+    }
+  }
+  
+  if (config$cell_size_metres < 25 || config$cell_size_metres > 100 || config$cell_size_metres %% 5 != 0) {
+    config_value_error("cell_size_metres must be a multiple of 5 between 25 and 100.")
+  }
+}
+validate_config(config)
+
+```
+3. Load Spatial Data
+```{r}
+# Load rule polygons and elevation data as spatial objects
+rulepolys <- st_read(config$rulepolys_file)
+elevation <- fread(config$elevation)
+
+# Define workspace and output directories
+wksp <- config$temp_folder
+if (!dir.exists(wksp)) dir.create(wksp, recursive = TRUE)
+
+# Load DEM (Digital Elevation Model) data
+dem <- if (file.exists(config$dem)) {
+  rast(config$dem)
+} else {
+  rast(system.file("external/test.grd", package="terra")) # Placeholder if DEM does not exist
+}
+
+```
+
+4. Aspect and Slope Calculations
+```{r}
+# Calculate slope and aspect using terrain functions
+slope <- terrain(dem, opt = "slope", unit = "degrees")
+aspect <- terrain(dem, opt = "aspect", unit = "degrees")
+
+```
+
+5. Rasterize Rule Polygons
+
+```{r}
+# Rasterize rule polygons to align with DEM resolution
+rule_raster <- rasterize(rulepolys, dem, field = "polygon_number", touches = TRUE)
+rule_expanded <- focal(rule_raster, w = matrix(1, 3, 3), fun = "mean")  # expand by a specified factor
+
+```
+
+6. Initial Ecosystem Classification Raster
+```{r}
+# Initialize BEC classification raster based on elevation, aspect, rule polygons
+initialize_bec <- function(elevation, rule_raster, aspect, slope) {
+  bec_raster <- rast(rule_raster)
+  values(bec_raster) <- NA
+  
+  for (row in 1:nrow(elevation)) {
+    # Define aspect zone and elevation ranges
+    cool_range <- c(elevation[row, cool_low], elevation[row, cool_high])
+    warm_range <- c(elevation[row, warm_low], elevation[row, warm_high])
+    
+    # Apply elevation and aspect-based classifications
+    bec_raster <- classify(bec_raster, cool_range, elevation[row, becvalue])
+  }
+  
+  return(bec_raster)
+}
+
+bec_raster <- initialize_bec(elevation, rule_raster, aspect, slope)
+
+```
+
+7. Post-Filtering: Majority Filter and Noise Reduction
+```{r}
+# Apply majority filter to smooth raster classifications
+apply_majority_filter <- function(bec_raster, slope, config) {
+  low_slope_filter <- matrix(1, config$majority_filter_size_slope_low_metres, config$majority_filter_size_slope_low_metres)
+  steep_slope_filter <- matrix(1, config$majority_filter_size_slope_steep_metres, config$majority_filter_size_slope_steep_metres)
+  
+  filtered_raster <- focal(bec_raster, w = ifelse(slope < config$steep_slope_threshold, low_slope_filter, steep_slope_filter), fun = "modal")
+  return(filtered_raster)
+}
+
+majority_filtered <- apply_majority_filter(bec_raster, slope, config)
+
+```
+
+8. Noise Filtering and Hole Filling
+
+```{r}
+# Use connected component labeling for noise removal in high-elevation zones
+noise_filtered <- classify(majority_filtered, c(0, config$noise_removal_threshold), NA, others = FALSE)
+
+# Fill small holes in zones to smooth classifications
+noise_filled <- focal(noise_filtered, w = matrix(1, 3, 3), fun = "modal", na.rm = TRUE)
+
+```
+9. Save Output to GeoPackage or Shapefile
+```{r}
+# Convert raster to polygons and save to output file
+bec_polygons <- as.polygons(noise_filled, dissolve = TRUE)
+bec_polygons <- st_as_sf(bec_polygons)
+
+# Add area and labels
+bec_polygons$area_ha <- st_area(bec_polygons) / 10000  # Convert to hectares
+bec_polygons$label <- "Classification"  # Placeholder for actual labels
+
+# Write to output file
+output_file <- config$out_file
+st_write(bec_polygons, output_file, driver = ifelse(grepl(".gpkg$", output_file), "GPKG", "ESRI Shapefile"))
+
+```
+
